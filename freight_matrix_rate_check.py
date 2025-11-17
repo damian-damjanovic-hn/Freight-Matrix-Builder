@@ -11,8 +11,10 @@ from ttkbootstrap.constants import *
 from ttkbootstrap.scrolled import ScrolledText
 MAX_REQUESTS_PER_MINUTE = 150
 REQUEST_INTERVAL = 60 / MAX_REQUESTS_PER_MINUTE
-API_URL = "https://api...."
+API_URL = "https://..."
 API_KEY = "api_key"
+RETRY_ATTEMPTS = 3
+BACKOFF_FACTOR = 2
 def get_output_path(prefix="transformed_data"):
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_filename = f"{prefix}_{current_time}.xlsx"
@@ -31,11 +33,33 @@ def transform_data(df):
     return [{"productCode": row['SKU'], "postCode": row['Postcode']} for _, row in df.iterrows()]
 def send_to_api(json_data):
     headers = {"api-key": API_KEY, "Content-Type": "application/json"}
-    response = requests.post(API_URL, headers=headers, data=json.dumps(json_data))
-    if response.status_code == 200:
-        return response.json()
-    else:
-        response.raise_for_status()
+    attempt = 0
+    while attempt < RETRY_ATTEMPTS:
+        try:
+            response = requests.post(API_URL, headers=headers, data=json.dumps(json_data))
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError:
+            status_code = response.status_code
+            error_map = {
+                400: "Bad Request: Check your input format.",
+                403: "Forbidden: Invalid API key or insufficient permissions.",
+                404: "Not Found: API endpoint or resource missing.",
+                409: "Conflict: Duplicate or invalid data detected.",
+                500: "Internal Server Error: Please try again later."
+            }
+            message = error_map.get(status_code, f"Unexpected Error: {status_code}")
+            if attempt < RETRY_ATTEMPTS - 1:
+                time.sleep(BACKOFF_FACTOR ** attempt)
+                attempt += 1
+            else:
+                raise Exception(f"API Error {status_code}: {message}")
+        except requests.exceptions.RequestException as req_err:
+            if attempt < RETRY_ATTEMPTS - 1:
+                time.sleep(BACKOFF_FACTOR ** attempt)
+                attempt += 1
+            else:
+                raise Exception(f"Network Error: {str(req_err)}")
 def save_results_to_excel(data, output_path):
     pd.DataFrame(data).to_excel(output_path, index=False)
 def create_template():
@@ -68,17 +92,24 @@ class IndividualCheckTab:
         try:
             json_data = [{"productCode": sku, "postCode": postcode}]
             response_data = send_to_api(json_data)[0]
-            delivery_possible = "Yes" if response_data.get('deliveryPossible') else "No"
-            result_text = (
-                f"Delivery Possible: {delivery_possible}\n"
-                f"Delivery Rate: ${response_data.get('deliveryRate')}\n"
-                f"Product Code: {response_data.get('productCode')}\n"
-                f"Postcode: {response_data.get('postCode')}"
-            )
-            self.result_label.configure(text=result_text)
+            if response_data.get('deliveryPossible'):
+                result_text = (
+                    f"Delivery Possible: Yes\n"
+                    f"Delivery Rate: ${response_data.get('deliveryRate')}\n"
+                    f"Product Code: {response_data.get('productCode')}\n"
+                    f"Postcode: {response_data.get('postCode')}"
+                )
+                self.result_label.configure(text=result_text, foreground="green")
+            else:
+                result_text = (
+                    f"Delivery Not Possible\n"
+                    f"Product Code: {response_data.get('productCode')}\n"
+                    f"Postcode: {response_data.get('postCode')}"
+                )
+                self.result_label.configure(text=result_text, foreground="red")
             self.app.log(f"Checked rate for SKU {sku}, Postcode {postcode}", "INFO")
         except Exception as e:
-            self.result_label.configure(text=f"Error: {str(e)}")
+            self.result_label.configure(text=f"Error: {str(e)}", foreground="red")
             self.app.log(str(e), "ERROR")
 class BulkProcessingTab:
     def __init__(self, parent, app):
@@ -131,20 +162,22 @@ class BulkProcessingTab:
             self.app.root.after(0, lambda: self.progress.configure(maximum=total_batches))
             for i in range(0, len(json_data), MAX_REQUESTS_PER_MINUTE):
                 batch = json_data[i:i+MAX_REQUESTS_PER_MINUTE]
-                response_data.extend(send_to_api(batch))
+                try:
+                    response_data.extend(send_to_api(batch))
+                except Exception as e:
+                    self.app.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                    self.app.log(str(e), "ERROR")
+                    break
                 self.app.root.after(0, lambda: self.progress.step(1))
                 time.sleep(REQUEST_INTERVAL)
-            output_path = get_output_path()
-            save_results_to_excel(response_data, output_path)
-            self.app.results_data = response_data
-            self.app.root.after(0, lambda: self.app.update_results(response_data))
-            self.app.root.after(0, lambda: messagebox.showinfo("Success", f"Processed data saved to:\n{output_path}"))
-            self.app.log(f"Processed file: {output_path}", "SUCCESS")
-            self.app.root.after(0, lambda: self.app.set_state("Completed", style=SUCCESS))
-        except Exception as e:
-            self.app.root.after(0, lambda: messagebox.showerror("Error", str(e)))
-            self.app.log(str(e), "ERROR")
-            self.app.root.after(0, lambda: self.app.set_state("Error", style=DANGER))
+            if response_data:
+                output_path = get_output_path()
+                save_results_to_excel(response_data, output_path)
+                self.app.results_data = response_data
+                self.app.root.after(0, lambda: self.app.update_results(response_data))
+                self.app.root.after(0, lambda: messagebox.showinfo("Success", f"Processed data saved to:\n{output_path}"))
+                self.app.log(f"Processed file: {output_path}", "SUCCESS")
+                self.app.root.after(0, lambda: self.app.set_state("Completed", style=SUCCESS))
         finally:
             self.app.root.after(0, lambda: self.progress.configure(value=0))
             self.app.root.after(0, lambda: self.set_buttons_state(NORMAL))
